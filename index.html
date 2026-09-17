@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CSSFontFace WebKit Test</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: #0b0d10;
+    color: #d7dee8;
+    font-family: "SF Mono", "Menlo", "Consolas", monospace;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  h1 {
+    font-size: 18px;
+    margin: 0 0 6px 0;
+    letter-spacing: 0.02em;
+  }
+  .subtitle {
+    color: #7d8794;
+    font-size: 12px;
+    margin-bottom: 20px;
+  }
+  .banner {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 18px 22px;
+    margin: 16px 0;
+    border-radius: 8px;
+    border: 2px solid #232a34;
+    background: #12151a;
+    transition: all .25s ease;
+  }
+  .banner .icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: #333;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+  .banner .text {
+    flex: 1;
+  }
+  .banner .title {
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  .banner .detail {
+    font-size: 12px;
+    color: #7d8794;
+    margin-top: 3px;
+  }
+  .banner.pending {
+    border-color: #1565c0;
+    background: #0d1420;
+  }
+  .banner.pending .icon { background: #1565c0; color: #fff; }
+  .banner.pending .title { color: #60a5fa; }
+  .banner.pass {
+    border-color: #2e7d32;
+    background: #0d1f10;
+  }
+  .banner.pass .icon { background: #2e7d32; color: #fff; }
+  .banner.pass .title { color: #4ade80; }
+  .banner.fail {
+    border-color: #c62828;
+    background: #1f0d0d;
+  }
+  .banner.fail .icon { background: #c62828; color: #fff; }
+  .banner.fail .title { color: #f87171; }
+  .banner.working .icon {
+    animation: pulse 1.2s infinite;
+  }
+  @keyframes pulse {
+    0%,100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    background: #232a34;
+    color: #7d8794;
+    margin-left: 8px;
+    vertical-align: middle;
+  }
+  .badge.ok { background: #1e3a2a; color: #4ade80; }
+  .badge.warn { background: #3a2f1a; color: #fbbf24; }
+  .tests {
+    margin: 20px 0;
+  }
+  .test {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    padding: 10px 14px;
+    border-bottom: 1px solid #1a1f27;
+    font-size: 12px;
+  }
+  .test:last-child { border-bottom: none; }
+  .test .dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #333;
+    flex-shrink: 0;
+  }
+  .test .name { min-width: 240px; color: #7d8794; }
+  .test .detail { color: #4d5560; margin-left: auto; font-size: 11px; }
+  .test.pending .dot { background: #1565c0; animation: pulse 1s infinite; }
+  .test.pending .name { color: #60a5fa; }
+  .test.pass .dot { background: #4ade80; }
+  .test.pass .name { color: #4ade80; }
+  .test.pass .detail { color: #4ade80; }
+  .test.fail .dot { background: #f87171; }
+  .test.fail .name { color: #f87171; }
+  .test.fail .detail { color: #f87171; }
+  .test.skip .dot { background: #666; }
+  .test.skip .name { color: #666; }
+  button {
+    padding: 10px 22px;
+    border-radius: 6px;
+    border: 1px solid #232a34;
+    background: #171b22;
+    color: #d7dee8;
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all .15s;
+  }
+  button:hover:not(:disabled) {
+    border-color: #2f3947;
+    background: #1e242e;
+  }
+  button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  button.primary {
+    border-color: #1e3a44;
+    background: #0e1c22;
+    color: #6ee7ff;
+  }
+  button.primary:hover:not(:disabled) {
+    background: #122530;
+  }
+  pre#log {
+    margin-top: 20px;
+    padding: 14px;
+    background: #0a0c0f;
+    border: 1px solid #1a1f27;
+    border-radius: 6px;
+    max-height: 300px;
+    overflow-y: auto;
+    font-size: 11.5px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #7d8794;
+  }
+</style>
+</head>
+<body>
+
+<h1>CSSFontFace WebKit Test <span class="badge" id="fw-badge">fw: —</span></h1>
+<div class="subtitle">Confirms UAF + reclaim + arbitrary read primitive on PS4 firmware</div>
+
+<div class="banner" id="banner">
+  <div class="icon">⋯</div>
+  <div class="text">
+    <div class="title" id="banner-title">Ready</div>
+    <div class="detail" id="banner-detail">Click "Run WebKit Test" to begin</div>
+  </div>
+</div>
+
+<div style="margin: 16px 0;">
+  <button class="primary" id="btn-run">Run WebKit Test</button>
+  <button id="btn-clear" style="margin-left: 8px;">Clear</button>
+</div>
+
+<div class="tests" id="tests"></div>
+
+<pre id="log">Ready.
+</pre>
+
+<script src="src/main.js"></script>
+</body>
+</html>
